@@ -104,6 +104,14 @@ alter table public.doorsteps enable row level security;
 alter table public.territories enable row level security;
 alter table public.expenses enable row level security;
 
+grant select, insert, update, delete on public.profiles to authenticated;
+grant select, insert, update, delete on public.customers to authenticated;
+grant select, insert, update, delete on public.bookings to authenticated;
+grant select, insert, update, delete on public.leads to authenticated;
+grant select, insert, update, delete on public.doorsteps to authenticated;
+grant select, insert, update, delete on public.territories to authenticated;
+grant select, insert, update, delete on public.expenses to authenticated;
+
 drop policy if exists "profiles own rows" on public.profiles;
 create policy "profiles own rows" on public.profiles
 for all to authenticated using (id = auth.uid()) with check (id = auth.uid());
@@ -167,29 +175,16 @@ end;
 $$;
 
 drop trigger if exists profiles_updated_at on public.profiles;
-create trigger profiles_updated_at before update on public.profiles
-for each row execute procedure public.set_updated_at();
-
+create trigger profiles_updated_at before update on public.profiles for each row execute procedure public.set_updated_at();
 drop trigger if exists customers_updated_at on public.customers;
-create trigger customers_updated_at before update on public.customers
-for each row execute procedure public.set_updated_at();
-
+create trigger customers_updated_at before update on public.customers for each row execute procedure public.set_updated_at();
 drop trigger if exists bookings_updated_at on public.bookings;
-create trigger bookings_updated_at before update on public.bookings
-for each row execute procedure public.set_updated_at();
-
+create trigger bookings_updated_at before update on public.bookings for each row execute procedure public.set_updated_at();
 drop trigger if exists leads_updated_at on public.leads;
-create trigger leads_updated_at before update on public.leads
-for each row execute procedure public.set_updated_at();
-
+create trigger leads_updated_at before update on public.leads for each row execute procedure public.set_updated_at();
 drop trigger if exists doorsteps_updated_at on public.doorsteps;
-create trigger doorsteps_updated_at before update on public.doorsteps
-for each row execute procedure public.set_updated_at();
-
+create trigger doorsteps_updated_at before update on public.doorsteps for each row execute procedure public.set_updated_at();
 drop trigger if exists territories_updated_at on public.territories;
-create trigger territories_updated_at before update on public.territories
-for each row execute procedure public.set_updated_at();
-
+create trigger territories_updated_at before update on public.territories for each row execute procedure public.set_updated_at();
 drop trigger if exists expenses_updated_at on public.expenses;
-create trigger expenses_updated_at before update on public.expenses
-for each row execute procedure public.set_updated_at();
+create trigger expenses_updated_at before update on public.expenses for each row execute procedure public.set_updated_at();
