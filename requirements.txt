@@ -3,3 +3,6 @@ pandas>=2.2
 folium>=0.17
 streamlit-folium>=0.24
 supabase>=2.28
+
+requests>=2.32
+googlemaps>=4.10
