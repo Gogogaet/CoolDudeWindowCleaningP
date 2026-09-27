@@ -1,102 +1,296 @@
 import json
+import os
 from datetime import date, datetime, timedelta
 
+import folium
 import pandas as pd
 import streamlit as st
-import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+from supabase import Client, create_client
+from supabase.client import ClientOptions
 
-st.set_page_config(
-    page_title="Cool Dudes Window Cleaning — Field Desk",
-    page_icon="🧽",
-    layout="wide",
-)
+st.set_page_config(page_title="Cool Dudes Window Cleaning", page_icon="🧽", layout="wide")
 
-DEFAULT = {
-    "bookings": [],
-    "doors": [],
-    "goal": 1000.0,
-    "profile": {
-        "name": "Jacob",
-        "business": "Cool Dudes Window Cleaning",
-        "email": "",
-        "phone": "",
-    },
-    "territory": None,
+DEFAULT_PROFILE = {
+    "full_name": "Jacob",
+    "business_name": "Cool Dudes Window Cleaning",
+    "email": "",
+    "phone": "",
+    "monthly_goal": 1000.0,
 }
 
-if "data" not in st.session_state:
-    st.session_state.data = json.loads(json.dumps(DEFAULT))
-data = st.session_state.data
+
+def get_secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return os.getenv(name, default)
 
 
-def money(value):
-    return f"${float(value or 0):,.2f}"
+def money(v):
+    return "$" + f"{float(v or 0):,.2f}"
 
 
-def save():
-    st.session_state.data = data
+def iso_now():
+    return datetime.utcnow().isoformat()
 
 
-def month_revenue():
-    today = date.today()
-    total = 0.0
-    for booking in data["bookings"]:
-        try:
-            d = date.fromisoformat(booking["date"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        if d.year == today.year and d.month == today.month:
-            total += float(booking.get("amount", 0) or 0)
-    return total
+def is_demo():
+    return st.session_state.sb is None
 
 
-st.markdown("""
-<style>
-.brand{font-size:1.2rem;font-weight:800}
-.brand small{display:block;color:#6b8295;font-size:.67rem;letter-spacing:.08em;font-weight:500}
-.metric-card{border:1px solid #d4e6f5;border-radius:14px;padding:1rem;background:#fff;min-height:105px}
-.metric-label{color:#58738b;font-size:.78rem}
-.metric-value{font-size:1.7rem;font-weight:800;margin-top:.35rem}
-.metric-hint{color:#6b8295;font-size:.7rem}
-</style>
-""", unsafe_allow_html=True)
+if "sb" not in st.session_state:
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_PUBLISHABLE_KEY") or get_secret("SUPABASE_ANON_KEY")
+    st.session_state.sb = (
+        create_client(
+            url,
+            key,
+            options=ClientOptions(auto_refresh_token=True, persist_session=False),
+        )
+        if url and key
+        else None
+    )
+
+sb: Client | None = st.session_state.sb
+
+if "demo" not in st.session_state:
+    st.session_state.demo = {
+        t: [] for t in ["customers", "bookings", "leads", "doorsteps", "territories", "expenses"]
+    }
+if "profile" not in st.session_state:
+    st.session_state.profile = DEFAULT_PROFILE.copy()
+
+
+def rows(table, order="created_at", desc=True):
+    if is_demo():
+        return st.session_state.demo[table]
+    try:
+        r = sb.table(table).select("*").order(order, desc=desc).execute()
+        return r.data or []
+    except Exception as e:
+        st.error(f"Could not load {table}: {e}")
+        return []
+
+
+def insert(table, payload):
+    if is_demo():
+        item = dict(payload)
+        item["id"] = f"demo-{datetime.now().timestamp()}"
+        item["created_at"] = iso_now()
+        st.session_state.demo[table].append(item)
+        return item
+    try:
+        r = sb.table(table).insert(payload).select("*").execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        st.error(f"Could not save {table}: {e}")
+        return None
+
+
+def update(table, row_id, payload):
+    if is_demo():
+        for r in st.session_state.demo[table]:
+            if r["id"] == row_id:
+                r.update(payload)
+                return r
+        return None
+    try:
+        r = sb.table(table).update(payload).eq("id", row_id).select("*").execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        st.error(f"Could not update {table}: {e}")
+        return None
+
+
+def remove(table, row_id):
+    if is_demo():
+        st.session_state.demo[table] = [r for r in st.session_state.demo[table] if r["id"] != row_id]
+        return True
+    try:
+        sb.table(table).delete().eq("id", row_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Could not delete {table}: {e}")
+        return False
+
+
+def get_profile(user_id):
+    if is_demo():
+        return st.session_state.profile
+    try:
+        r = sb.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
+        if r.data:
+            return r.data
+        profile = {**DEFAULT_PROFILE, "id": user_id}
+        sb.table("profiles").upsert(profile).execute()
+        return profile
+    except Exception as e:
+        st.error(f"Could not load profile: {e}")
+        return {**DEFAULT_PROFILE, "id": user_id}
+
+
+def current_user():
+    if is_demo() or not st.session_state.get("auth_session"):
+        return None
+    try:
+        return sb.auth.get_user().user
+    except Exception:
+        return None
+
+
+def sign_out():
+    try:
+        sb.auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.pop("auth_session", None)
+    st.session_state.pop("auth_user", None)
+    st.rerun()
+
+
+user = current_user()
+if not is_demo() and user is None:
+    st.markdown("## Cool Dudes Window Cleaning")
+    st.write("Your private business workspace")
+
+    sign_in, sign_up = st.tabs(["Sign in", "Create account"])
+    with sign_in:
+        with st.form("login"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            go = st.form_submit_button("Sign in", type="primary")
+        if go:
+            try:
+                r = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                st.session_state.auth_session = r.session
+                st.session_state.auth_user = r.user
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sign-in failed: {e}")
+
+        with st.form("reset"):
+            reset_email = st.text_input("Reset email")
+            reset = st.form_submit_button("Send reset email")
+        if reset:
+            try:
+                sb.auth.reset_password_for_email(reset_email.strip())
+                st.success("Reset instructions requested.")
+            except Exception as e:
+                st.error(f"Reset request failed: {e}")
+
+    with sign_up:
+        with st.form("signup"):
+            name = st.text_input("Your name")
+            business = st.text_input("Business name", value="Cool Dudes Window Cleaning")
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input("Password", type="password", key="signup_password")
+            create = st.form_submit_button("Create account", type="primary")
+        if create:
+            try:
+                r = sb.auth.sign_up(
+                    {
+                        "email": email.strip(),
+                        "password": password,
+                        "options": {"data": {"full_name": name.strip(), "business_name": business.strip()}},
+                    }
+                )
+                if r.session:
+                    st.session_state.auth_session = r.session
+                    st.session_state.auth_user = r.user
+                    st.rerun()
+                st.success("Account created. Check your email, then sign in.")
+            except Exception as e:
+                st.error(f"Account creation failed: {e}")
+    st.stop()
+
+if is_demo():
+    user_id = "demo"
+    profile = st.session_state.profile
+else:
+    user = current_user()
+    user_id = user.id
+    profile = get_profile(user_id)
+
+customers = rows("customers")
+bookings = rows("bookings", order="service_date")
+leads = rows("leads", order="next_followup")
+doors = rows("doorsteps")
+territories = rows("territories")
+expenses = rows("expenses", order="expense_date")
+
+st.markdown(
+    """
+    <style>
+    .block-container{max-width:1500px;padding-top:1.4rem}
+    .brand{font-size:1.15rem;font-weight:800;line-height:1.05}
+    .brand small{display:block;color:#6b8295;font-size:.64rem;letter-spacing:.08em;margin-top:.25rem}
+    .metric-card{border:1px solid #d4e6f5;border-radius:14px;padding:1rem;background:white;min-height:105px}
+    .metric-label{color:#58738b;font-size:.77rem}.metric-value{font-size:1.65rem;font-weight:800;margin:.35rem 0}.metric-hint{color:#6b8295;font-size:.7rem}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.markdown(
-        '<div class="brand">Cool Dudes Window Cleaning<small>WINDOW CLEANING · FIELD DESK</small></div>',
+        '<div class="brand">Cool Dudes Window Cleaning'
+        '<small>WINDOW CLEANING · FIELD DESK</small></div>',
         unsafe_allow_html=True,
     )
     st.divider()
-    page = st.radio("Navigation", ["Overview", "Bookings", "Territory map", "Goals", "Account"])
-    st.info(
-        "Working data is kept in this Streamlit session. "
-        "Export JSON from Account before closing the app."
+    page = st.radio(
+        "Navigation",
+        ["Dashboard", "Customers", "Bookings", "Leads", "Territory", "Finances", "Account"],
     )
-
-profile_name = data["profile"].get("name") or "User"
-st.caption(f"👤 {profile_name}")
-
-if page == "Overview":
-    st.markdown(f"### Good day, {profile_name}")
-    st.write("Here’s your window-cleaning business at a glance.")
+    st.caption(profile.get("full_name") or "User")
+    if not is_demo() and st.button("Sign out", use_container_width=True):
+        sign_out()
     st.divider()
+    if is_demo():
+        st.warning("Demo mode: data is temporary.")
+    else:
+        st.success("Connected database")
 
-    total = sum(float(b.get("amount", 0) or 0) for b in data["bookings"])
-    jobs = len(data["bookings"])
-    doors = len(data["doors"])
-    goal = float(data.get("goal", 1000) or 0)
-    current = month_revenue()
-    pct = min(1.0, current / goal) if goal else 0.0
+today = date.today()
+month_key = today.strftime("%Y-%m")
 
-    metrics = [
-        ("Revenue booked", money(total), "From saved bookings"),
-        ("Jobs booked", str(jobs), "Saved appointments"),
-        ("Doors tracked", str(doors), "Across your territory"),
-        ("Monthly goal", money(goal), f"{money(current)} this month"),
+
+def month_bookings():
+    return [
+        b for b in bookings
+        if str(b.get("service_date", ""))[:7] == month_key
+        and b.get("status") != "Cancelled"
     ]
-    for col, item in zip(st.columns(4), metrics):
+
+
+def month_expenses():
+    return [
+        e for e in expenses
+        if str(e.get("expense_date", ""))[:7] == month_key
+    ]
+
+
+if page == "Dashboard":
+    st.markdown(f"## Good day, {profile.get('full_name') or 'there'}")
+    st.write("Your business at a glance.")
+    mb = month_bookings()
+    me = month_expenses()
+    revenue = sum(float(b.get("amount", 0) or 0) for b in mb)
+    costs = sum(float(e.get("amount", 0) or 0) for e in me)
+    goal = float(profile.get("monthly_goal", 1000) or 1000)
+    pct = min(1.0, revenue / goal) if goal else 0
+
+    for col, item in zip(
+        st.columns(4),
+        [
+            ("Revenue this month", money(revenue), "Scheduled / completed"),
+            ("Booked jobs", str(len(mb)), "This month"),
+            ("Open leads", str(sum(l.get("status") not in ("Won", "Lost") for l in leads)), "Need follow-up"),
+            ("Monthly goal", money(goal), f"{money(revenue)} booked"),
+        ],
+    ):
         with col:
             st.markdown(
                 f'<div class="metric-card"><div class="metric-label">{item[0]}</div>'
@@ -107,322 +301,554 @@ if page == "Overview":
     left, right = st.columns([1.45, 1])
     with left:
         st.subheader("Revenue over time")
-        days = st.selectbox(
-            "Range", [30, 90, 365], format_func=lambda x: f"Last {x} days"
-        )
-        end = date.today()
-        start = end - timedelta(days=days - 1)
-        points = []
-        for i in range(days):
+        start = today - timedelta(days=29)
+        chart = []
+        for i in range(30):
             d = start + timedelta(days=i)
-            value = sum(
+            v = sum(
                 float(b.get("amount", 0) or 0)
-                for b in data["bookings"]
-                if b.get("date") == d.isoformat()
+                for b in bookings
+                if b.get("service_date") == d.isoformat() and b.get("status") != "Cancelled"
             )
-            points.append({"Date": d, "Revenue": value})
-        st.line_chart(pd.DataFrame(points).set_index("Date"), height=260)
+            chart.append({"Date": d, "Revenue": v})
+        st.line_chart(pd.DataFrame(chart).set_index("Date"), height=260)
 
     with right:
         st.subheader("Monthly target")
-        st.metric("Progress", f"{money(current)} / {money(goal)}")
+        st.metric("Progress", f"{money(revenue)} / {money(goal)}")
         st.progress(pct)
-        st.caption(f"{round(pct * 100)}% of your monthly revenue goal")
-        st.subheader("Recent bookings")
-        recent = sorted(
-            data["bookings"], key=lambda b: b.get("date", ""), reverse=True
-        )[:3]
-        if not recent:
-            st.caption("Your saved bookings will appear here.")
-        for b in recent:
+        st.caption(f"{round(pct * 100)}% of your monthly goal")
+        st.subheader("Next jobs")
+        upcoming = [
+            b for b in bookings
+            if b.get("service_date", "") >= today.isoformat()
+            and b.get("status") != "Cancelled"
+        ][:5]
+        if not upcoming:
+            st.caption("No upcoming jobs.")
+        for b in upcoming:
             st.write(
-                f"**{b.get('name', 'Unnamed')}** · {b.get('date', '')} · "
+                f"**{b.get('service_date')}** · {b.get('customer_name') or 'Customer'} · "
                 f"{money(b.get('amount', 0))}"
             )
 
-elif page == "Bookings":
-    st.markdown("### Bookings")
-    st.write("Save appointments, customer details, and expected revenue.")
     st.divider()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Expenses this month", money(costs))
+    c2.metric("Customers", len(customers))
+    c3.metric("Doors marked yes", sum(d.get("status") == "yes" for d in doors))
 
-    with st.form("booking_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            customer = st.text_input("Customer name")
-            phone = st.text_input("Phone")
-            service_date = st.date_input("Service date", date.today())
-        with c2:
-            amount = st.number_input("Expected revenue ($)", 0.0, step=25.0)
-            status = st.selectbox(
-                "Status", ["Booked", "Completed", "Needs confirmation"]
+
+elif page == "Customers":
+    st.markdown("## Customers")
+    with st.expander("＋ Add customer"):
+        with st.form("customer_add"):
+            a, b = st.columns(2)
+            with a:
+                name = st.text_input("Name")
+                phone = st.text_input("Phone")
+                email = st.text_input("Email")
+            with b:
+                address = st.text_input("Address")
+                status = st.selectbox("Status", ["Active", "Past", "Do not contact"])
+                notes = st.text_area("Notes")
+            save_btn = st.form_submit_button("Save customer", type="primary")
+        if save_btn:
+            if not name.strip():
+                st.error("Name is required.")
+            else:
+                insert(
+                    "customers",
+                    {
+                        "owner_id": user_id,
+                        "name": name.strip(),
+                        "phone": phone.strip(),
+                        "email": email.strip(),
+                        "address": address.strip(),
+                        "status": status,
+                        "notes": notes.strip(),
+                    },
+                )
+                st.success("Customer saved.")
+                st.rerun()
+
+    q = st.text_input("Search customers")
+    found = [
+        c for c in customers
+        if q.lower() in (
+            f'{c.get("name","")} {c.get("phone","")} {c.get("email","")} {c.get("address","")}'
+        ).lower()
+    ]
+    if found:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Name": c.get("name", ""),
+                        "Phone": c.get("phone", ""),
+                        "Email": c.get("email", ""),
+                        "Address": c.get("address", ""),
+                        "Status": c.get("status", ""),
+                    }
+                    for c in found
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        choices = {
+            f'{c.get("name","Unnamed")} · {c.get("address","")}': c["id"] for c in found
+        }
+        pick = st.selectbox("Manage customer", [""] + list(choices))
+        if pick:
+            c = next(x for x in found if x["id"] == choices[pick])
+            st.write("### Edit customer")
+            with st.form("customer_edit"):
+                ename = st.text_input("Name", c.get("name", ""))
+                ephone = st.text_input("Phone", c.get("phone", ""))
+                eemail = st.text_input("Email", c.get("email", ""))
+                eaddress = st.text_input("Address", c.get("address", ""))
+                estatus = st.selectbox(
+                    "Status",
+                    ["Active", "Past", "Do not contact"],
+                    index=["Active", "Past", "Do not contact"].index(c.get("status", "Active")),
+                )
+                enotes = st.text_area("Notes", c.get("notes", ""))
+                update_btn = st.form_submit_button("Update customer", type="primary")
+            if update_btn:
+                update(
+                    "customers",
+                    c["id"],
+                    {
+                        "name": ename.strip(),
+                        "phone": ephone.strip(),
+                        "email": eemail.strip(),
+                        "address": eaddress.strip(),
+                        "status": estatus,
+                        "notes": enotes.strip(),
+                    },
+                )
+                st.success("Customer updated.")
+                st.rerun()
+            if st.button("Delete customer"):
+                remove("customers", c["id"])
+                st.rerun()
+    else:
+        st.info("No customers found.")
+
+
+elif page == "Bookings":
+    st.markdown("## Bookings")
+    customer_choices = {"No customer": None}
+    customer_choices.update(
+        {f'{c.get("name","Unnamed")} · {c.get("address","")}': c["id"] for c in customers}
+    )
+
+    with st.expander("＋ New booking", expanded=True):
+        with st.form("booking_add"):
+            a, b = st.columns(2)
+            with a:
+                choice = st.selectbox("Customer", list(customer_choices))
+                service_date = st.date_input("Service date", today)
+                service_time = st.time_input("Start time", datetime.now().time().replace(second=0, microsecond=0))
+                service = st.text_input("Service", "Exterior window cleaning")
+            with b:
+                amount = st.number_input("Expected revenue ($)", 0.0, step=25.0)
+                status = st.selectbox(
+                    "Status", ["Booked", "Completed", "Needs confirmation", "Cancelled"]
+                )
+                address = st.text_input("Service address")
+                notes = st.text_area("Job notes")
+            add = st.form_submit_button("Save booking", type="primary")
+        if add:
+            customer_id = customer_choices[choice]
+            customer = next((c for c in customers if c["id"] == customer_id), None)
+            insert(
+                "bookings",
+                {
+                    "owner_id": user_id,
+                    "customer_id": customer_id,
+                    "customer_name": customer.get("name", "") if customer else "",
+                    "service_date": service_date.isoformat(),
+                    "service_time": service_time.strftime("%H:%M"),
+                    "service": service.strip(),
+                    "amount": float(amount),
+                    "status": status,
+                    "address": address.strip() or (customer.get("address", "") if customer else ""),
+                    "notes": notes.strip(),
+                },
             )
-            address = st.text_input("Service address")
-        submit = st.form_submit_button("Save booking", type="primary")
-
-    if submit:
-        if not customer.strip() or not address.strip():
-            st.error("Enter the customer name and service address.")
-        else:
-            data["bookings"].append({
-                "id": str(datetime.now().timestamp()),
-                "name": customer.strip(),
-                "phone": phone.strip(),
-                "date": service_date.isoformat(),
-                "amount": float(amount),
-                "address": address.strip(),
-                "status": status,
-            })
-            save()
             st.success("Booking saved.")
             st.rerun()
 
-    search = st.text_input("Search name or address")
-    filt = st.selectbox("Filter", ["All bookings", "Upcoming", "Completed"])
-    matches = []
-    for b in data["bookings"]:
-        hay = f'{b.get("name","")} {b.get("address","")}'.lower()
-        if search.strip() and search.lower() not in hay:
-            continue
-        if filt == "Completed" and b.get("status") != "Completed":
-            continue
+    filt = st.selectbox("Show", ["All", "Upcoming", "Completed", "Needs confirmation", "Cancelled"])
+    shown = []
+    for b in bookings:
+        keep = filt == "All"
         if filt == "Upcoming":
-            try:
-                if date.fromisoformat(b["date"]) < date.today() or b.get("status") == "Completed":
-                    continue
-            except (ValueError, KeyError, TypeError):
-                continue
-        matches.append(b)
+            keep = b.get("service_date", "") >= today.isoformat() and b.get("status") != "Cancelled"
+        elif filt in ("Completed", "Needs confirmation", "Cancelled"):
+            keep = b.get("status") == filt
+        if keep:
+            shown.append(b)
 
-    if matches:
+    if shown:
         st.dataframe(
-            pd.DataFrame([{
-                "Customer": b.get("name",""),
-                "Service date": b.get("date",""),
-                "Address": b.get("address",""),
-                "Revenue": float(b.get("amount",0) or 0),
-                "Status": b.get("status",""),
-            } for b in matches]),
+            pd.DataFrame(
+                [
+                    {
+                        "Date": b.get("service_date", ""),
+                        "Time": b.get("service_time", ""),
+                        "Customer": b.get("customer_name", ""),
+                        "Service": b.get("service", ""),
+                        "Address": b.get("address", ""),
+                        "Revenue": float(b.get("amount", 0) or 0),
+                        "Status": b.get("status", ""),
+                    }
+                    for b in shown
+                ]
+            ),
             use_container_width=True,
             hide_index=True,
             column_config={"Revenue": st.column_config.NumberColumn(format="$ %.2f")},
         )
-        labels = {
-            f'{b.get("name","Unnamed")} · {b.get("date","")} · {money(b.get("amount",0))}': b["id"]
-            for b in matches
+        choices = {
+            f'{b.get("service_date")} · {b.get("customer_name","Customer")} · {money(b.get("amount",0))}': b["id"]
+            for b in shown
         }
-        pick = st.selectbox("Delete booking", [""] + list(labels))
-        if pick and st.button("Delete selected booking"):
-            data["bookings"] = [b for b in data["bookings"] if b["id"] != labels[pick]]
-            save()
-            st.success("Booking deleted.")
+        delete_pick = st.selectbox("Delete booking", [""] + list(choices))
+        if delete_pick and st.button("Delete selected booking"):
+            remove("bookings", choices[delete_pick])
             st.rerun()
     else:
-        st.caption("No bookings match this view.")
+        st.info("No bookings match this view.")
 
-elif page == "Territory map":
-    st.markdown("### Territory map")
-    st.write("Draw a service zone and track every doorstep by status.")
-    st.divider()
 
-    map_col, side_col = st.columns([1.5, 1])
-    with map_col:
-        fmap = folium.Map(location=[41.433, -96.490], zoom_start=14, control_scale=True)
-        colors = {"not": "#71869a", "no": "#d45e55", "maybe": "#dfa52e", "yes": "#23966d"}
+elif page == "Leads":
+    st.markdown("## Leads")
+    st.write("Track door-to-door prospects, quotes, and follow-ups.")
 
-        for i, door in enumerate(data["doors"], 1):
-            lat, lng = door.get("lat"), door.get("lng")
-            if lat is not None and lng is not None:
-                folium.CircleMarker(
-                    [lat, lng],
-                    radius=8,
-                    color="white",
-                    weight=2,
-                    fill=True,
-                    fill_opacity=.95,
-                    fill_color=colors.get(door.get("status","not")),
-                    popup=f"{i}. {door.get('address','')} · {door.get('status','')}",
-                ).add_to(fmap)
-
-        if data.get("territory"):
-            folium.GeoJson(
-                data["territory"],
-                style_function=lambda _: {
-                    "color": "#1769aa",
-                    "fillColor": "#1769aa",
-                    "fillOpacity": .18,
-                    "weight": 3,
-                    "dashArray": "7 5",
+    with st.expander("＋ Add lead"):
+        with st.form("lead_add"):
+            a, b = st.columns(2)
+            with a:
+                lname = st.text_input("Name")
+                lphone = st.text_input("Phone")
+                lemail = st.text_input("Email")
+                laddress = st.text_input("Address")
+            with b:
+                source = st.selectbox("Source", ["Door-to-door", "Referral", "Website", "Call", "Other"])
+                lstatus = st.selectbox(
+                    "Status", ["New", "Contacted", "Follow-up", "Quoted", "Won", "Lost"]
+                )
+                value = st.number_input("Estimated value ($)", 0.0, step=25.0)
+                follow = st.date_input("Next follow-up", today)
+            lnotes = st.text_area("Notes")
+            save_lead = st.form_submit_button("Save lead", type="primary")
+        if save_lead:
+            insert(
+                "leads",
+                {
+                    "owner_id": user_id,
+                    "name": lname.strip(),
+                    "phone": lphone.strip(),
+                    "email": lemail.strip(),
+                    "address": laddress.strip(),
+                    "source": source,
+                    "status": lstatus,
+                    "estimated_value": float(value),
+                    "next_followup": follow.isoformat(),
+                    "notes": lnotes.strip(),
                 },
-            ).add_to(fmap)
-
-        Draw(
-            export=True,
-            draw_options={
-                "polygon": True,
-                "polyline": False,
-                "rectangle": False,
-                "circle": False,
-                "circlemarker": False,
-                "marker": False,
-            },
-            edit_options={"edit": True, "remove": True},
-        ).add_to(fmap)
-
-        result = st_folium(fmap, height=520, use_container_width=True)
-        drawing = result.get("last_active_drawing")
-        if drawing and drawing.get("geometry", {}).get("type") == "Polygon":
-            data["territory"] = drawing
-            save()
-
-        st.caption(
-            "Interactive OpenStreetMap map centered on Fremont, Nebraska. "
-            "Draw the service territory directly on the map."
-        )
-
-    with side_col:
-        st.subheader("Door status")
-        status_filter = st.selectbox(
-            "Show", ["All", "Not knocked", "Said no", "Maybe", "Yes"]
-        )
-        status_map = {
-            "All": None,
-            "Not knocked": "not",
-            "Said no": "no",
-            "Maybe": "maybe",
-            "Yes": "yes",
-        }
-        visible = [
-            d for d in data["doors"]
-            if status_map[status_filter] is None
-            or d.get("status") == status_map[status_filter]
-        ]
-        if not visible:
-            st.caption("No doorsteps in this view.")
-        for d in visible:
-            st.write(
-                f'**{d.get("address","")}** · {d.get("status","")} · '
-                f'{d.get("note","")}'
             )
-
-        st.divider()
-        st.subheader("Add doorstep")
-        with st.form("door_form", clear_on_submit=True):
-            address = st.text_input("Home address")
-            status = st.selectbox(
-                "Status",
-                ["not", "no", "maybe", "yes"],
-                format_func=lambda x: {
-                    "not": "Not knocked",
-                    "no": "Said no",
-                    "maybe": "Maybe",
-                    "yes": "Yes",
-                }[x],
-            )
-            note = st.text_input("Note")
-            c1, c2 = st.columns(2)
-            with c1:
-                latitude = st.number_input(
-                    "Latitude", value=41.433000, format="%.6f"
-                )
-            with c2:
-                longitude = st.number_input(
-                    "Longitude", value=-96.490000, format="%.6f"
-                )
-            add = st.form_submit_button("Add doorstep", type="primary")
-
-        if add:
-            if not address.strip():
-                st.error("Enter an address.")
-            else:
-                data["doors"].append({
-                    "id": str(datetime.now().timestamp()),
-                    "address": address.strip(),
-                    "status": status,
-                    "note": note.strip(),
-                    "lat": float(latitude),
-                    "lng": float(longitude),
-                })
-                save()
-                st.success("Doorstep added.")
-                st.rerun()
-
-        if data.get("territory") and st.button("Clear territory outline"):
-            data["territory"] = None
-            save()
+            st.success("Lead saved.")
             st.rerun()
 
-elif page == "Goals":
-    st.markdown("### Goals & progress")
-    new_goal = st.number_input(
-        "Monthly revenue target ($)",
-        1.0,
-        value=float(data.get("goal", 1000)),
-        step=100.0,
-    )
-    if st.button("Save goal", type="primary"):
-        data["goal"] = float(new_goal)
-        save()
+    if leads:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Name": l.get("name", ""),
+                        "Address": l.get("address", ""),
+                        "Source": l.get("source", ""),
+                        "Status": l.get("status", ""),
+                        "Follow-up": l.get("next_followup", ""),
+                        "Value": float(l.get("estimated_value", 0) or 0),
+                    }
+                    for l in leads
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Value": st.column_config.NumberColumn(format="$ %.2f")},
+        )
+        choices = {f'{l.get("name","Unnamed")} · {l.get("address","")}': l["id"] for l in leads}
+        pick = st.selectbox("Manage lead", [""] + list(choices))
+        if pick:
+            lead = next(l for l in leads if l["id"] == choices[pick])
+            a, b = st.columns(2)
+            with a:
+                ns = st.selectbox(
+                    "Status",
+                    ["New", "Contacted", "Follow-up", "Quoted", "Won", "Lost"],
+                    index=["New", "Contacted", "Follow-up", "Quoted", "Won", "Lost"].index(lead.get("status", "New")),
+                )
+            with b:
+                nf = st.date_input(
+                    "Follow-up",
+                    date.fromisoformat(lead["next_followup"]) if lead.get("next_followup") else today,
+                )
+            if st.button("Save lead update", type="primary"):
+                update("leads", lead["id"], {"status": ns, "next_followup": nf.isoformat()})
+                st.rerun()
+            if st.button("Delete lead"):
+                remove("leads", lead["id"])
+                st.rerun()
+    else:
+        st.info("No leads yet.")
+
+
+elif page == "Territory":
+    st.markdown("## Territory")
+    st.write("Draw and save service zones, then track doorstep status.")
+
+    fmap = folium.Map(location=[41.433, -96.490], zoom_start=14, control_scale=True)
+    colors = {"not": "#71869a", "no": "#d45e55", "maybe": "#dfa52e", "yes": "#23966d"}
+
+    for door in doors:
+        if door.get("lat") is None or door.get("lng") is None:
+            continue
+        folium.CircleMarker(
+            [float(door["lat"]), float(door["lng"])],
+            radius=7,
+            color="white",
+            weight=2,
+            fill=True,
+            fill_color=colors.get(door.get("status"), "#71869a"),
+            fill_opacity=.95,
+            popup=f'{door.get("address","")} · {door.get("status","")}',
+        ).add_to(fmap)
+
+    for territory in territories:
+        geo = territory.get("geojson")
+        if geo:
+            try:
+                folium.GeoJson(
+                    geo,
+                    name=territory.get("name", "Service area"),
+                    style_function=lambda _: {
+                        "color": "#1769aa", "fillColor": "#1769aa",
+                        "fillOpacity": .18, "weight": 3, "dashArray": "7 5",
+                    },
+                ).add_to(fmap)
+            except Exception:
+                pass
+
+    Draw(
+        export=True,
+        draw_options={
+            "polygon": True, "rectangle": True, "polyline": False,
+            "circle": False, "circlemarker": False, "marker": False,
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(fmap)
+
+    map_result = st_folium(fmap, height=550, use_container_width=True)
+    drawing = map_result.get("last_active_drawing") if map_result else None
+
+    if drawing:
+        zone_name = st.text_input(
+            "New territory name",
+            value=f"Fremont Zone {len(territories)+1}",
+            key="new_zone_name",
+        )
+        if st.button("Save drawn territory", type="primary"):
+            insert(
+                "territories",
+                {"owner_id": user_id, "name": zone_name.strip(), "geojson": drawing},
+            )
+            st.success("Territory saved.")
+            st.rerun()
+
+    st.subheader("Add doorstep")
+    with st.form("door_add"):
+        address = st.text_input("Address")
+        a, b = st.columns(2)
+        with a:
+            lat = st.number_input("Latitude", value=41.433000, format="%.6f")
+        with b:
+            lng = st.number_input("Longitude", value=-96.490000, format="%.6f")
+        status = st.selectbox(
+            "Status", ["not", "no", "maybe", "yes"],
+            format_func=lambda x: {"not":"Not knocked","no":"Said no","maybe":"Maybe","yes":"Yes"}[x],
+        )
+        note = st.text_input("Note")
+        add_door = st.form_submit_button("Save doorstep", type="primary")
+    if add_door:
+        insert(
+            "doorsteps",
+            {
+                "owner_id": user_id,
+                "address": address.strip(),
+                "lat": float(lat),
+                "lng": float(lng),
+                "status": status,
+                "note": note.strip(),
+            },
+        )
+        st.success("Doorstep saved.")
         st.rerun()
 
-    current = month_revenue()
-    progress = min(1.0, current / float(data["goal"])) if data["goal"] else 0.0
-    st.metric("This month", money(current))
-    st.progress(progress)
+    if doors:
+        st.subheader("Tracked doors")
+        for d in doors[:40]:
+            a, b = st.columns([2.8, 1])
+            a.write(f'**{d.get("address","")}** · {d.get("note","")}')
+            ns = b.selectbox(
+                "Status",
+                ["not", "no", "maybe", "yes"],
+                index=["not", "no", "maybe", "yes"].index(d.get("status", "not")),
+                key=f'status_{d["id"]}',
+                label_visibility="collapsed",
+            )
+            if ns != d.get("status"):
+                update("doorsteps", d["id"], {"status": ns})
+                st.rerun()
 
-    for label, status in [
-        ("Doors marked yes", "yes"),
-        ("Follow-ups (maybe)", "maybe"),
-        ("Not yet knocked", "not"),
-        ("Not interested", "no"),
-    ]:
-        count = sum(d.get("status") == status for d in data["doors"])
-        st.write(f"**{label}:** {count}")
+
+elif page == "Finances":
+    st.markdown("## Finances")
+    st.write("Revenue, expenses, and simple net tracking.")
+
+    mb = month_bookings()
+    me = month_expenses()
+    revenue = sum(float(b.get("amount", 0) or 0) for b in mb)
+    costs = sum(float(e.get("amount", 0) or 0) for e in me)
+
+    for col, item in zip(
+        st.columns(3),
+        [("Revenue", revenue), ("Expenses", costs), ("Net before tax", revenue - costs)],
+    ):
+        col.metric(item[0], money(item[1]))
+
+    with st.expander("＋ Add expense"):
+        with st.form("expense_add"):
+            a, b = st.columns(2)
+            with a:
+                edate = st.date_input("Date", today)
+                category = st.selectbox(
+                    "Category", ["Supplies", "Fuel", "Marketing", "Insurance", "Equipment", "Other"]
+                )
+            with b:
+                amount = st.number_input("Amount ($)", 0.0, step=10.0)
+                note = st.text_input("Note")
+            add_expense = st.form_submit_button("Save expense", type="primary")
+        if add_expense:
+            insert(
+                "expenses",
+                {
+                    "owner_id": user_id,
+                    "expense_date": edate.isoformat(),
+                    "category": category,
+                    "amount": float(amount),
+                    "notes": note.strip(),
+                },
+            )
+            st.success("Expense saved.")
+            st.rerun()
+
+    if expenses:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Date": e.get("expense_date", ""),
+                        "Category": e.get("category", ""),
+                        "Amount": float(e.get("amount", 0) or 0),
+                        "Notes": e.get("notes", ""),
+                    }
+                    for e in expenses
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Amount": st.column_config.NumberColumn(format="$ %.2f")},
+        )
+
 
 else:
-    st.markdown("### Account & workspace")
+    st.markdown("## Account")
     with st.form("profile_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            new_name = st.text_input(
-                "Your name",
-                value=data["profile"].get("name", "Jacob"),
+        a, b = st.columns(2)
+        with a:
+            full_name = st.text_input("Your name", profile.get("full_name", ""))
+            business_name = st.text_input(
+                "Business name", profile.get("business_name", "Cool Dudes Window Cleaning")
             )
-            business = st.text_input(
-                "Business name",
-                value=data["profile"].get(
-                    "business", "Cool Dudes Window Cleaning"
-                ),
-            )
-        with c2:
+            phone = st.text_input("Phone", profile.get("phone", ""))
+        with b:
             email = st.text_input(
-                "Email", value=data["profile"].get("email", "")
+                "Email", profile.get("email", ""), disabled=not is_demo()
             )
-            phone = st.text_input(
-                "Phone", value=data["profile"].get("phone", "")
+            monthly_goal = st.number_input(
+                "Monthly revenue goal ($)",
+                min_value=1.0,
+                value=float(profile.get("monthly_goal", 1000) or 1000),
+                step=100.0,
             )
-        update = st.form_submit_button("Save profile", type="primary")
+        save_profile = st.form_submit_button("Save profile", type="primary")
 
-    if update:
-        data["profile"] = {
-            "name": new_name.strip() or "User",
-            "business": business.strip() or "Cool Dudes Window Cleaning",
-            "email": email.strip(),
+    if save_profile:
+        payload = {
+            "full_name": full_name.strip(),
+            "business_name": business_name.strip() or "Cool Dudes Window Cleaning",
             "phone": phone.strip(),
+            "monthly_goal": float(monthly_goal),
         }
-        save()
-        st.success("Profile saved for this session.")
+        if is_demo():
+            st.session_state.profile.update(payload)
+        else:
+            payload["email"] = email.strip()
+            update("profiles", user_id, payload)
+        st.success("Profile saved.")
         st.rerun()
 
-    st.info(
-        "This Python version does not yet provide secure authentication "
-        "or a shared cloud database."
-    )
+    if not is_demo():
+        with st.expander("Change password"):
+            with st.form("password_form"):
+                p1 = st.text_input("New password", type="password")
+                p2 = st.text_input("Confirm", type="password")
+                change = st.form_submit_button("Change password", type="primary")
+            if change:
+                if len(p1) < 8:
+                    st.error("Use at least 8 characters.")
+                elif p1 != p2:
+                    st.error("Passwords do not match.")
+                else:
+                    try:
+                        sb.auth.update_user({"password": p1})
+                        st.success("Password changed.")
+                    except Exception as e:
+                        st.error(f"Password change failed: {e}")
+
+    export = {
+        "profile": profile,
+        "customers": customers,
+        "bookings": bookings,
+        "leads": leads,
+        "doorsteps": doors,
+        "territories": territories,
+        "expenses": expenses,
+        "exported_at": iso_now(),
+    }
     st.download_button(
-        "Export my data (JSON)",
-        data=json.dumps(data, indent=2),
-        file_name="cool-dudes-data.json",
-        mime="application/json",
+        "Export all business data (JSON)",
+        json.dumps(export, indent=2, default=str),
+        "cool-dudes-business-export.json",
+        "application/json",
     )
-    if st.button("Clear session data"):
-        st.session_state.data = json.loads(json.dumps(DEFAULT))
-        st.rerun()
+    st.caption(
+        "Supabase mode uses authenticated requests and row-level security. "
+        "The public repository must never contain a Supabase secret/service-role key."
+    )
