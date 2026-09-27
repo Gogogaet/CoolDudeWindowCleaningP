@@ -4,10 +4,15 @@ from datetime import date, datetime, timedelta
 
 import folium
 import pandas as pd
+import requests
 import streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 from supabase import Client, create_client
+try:
+    import googlemaps
+except ImportError:
+    googlemaps = None
 from supabase.client import ClientOptions
 
 st.set_page_config(page_title="Cool Dudes Window Cleaning", page_icon="🧽", layout="wide")
@@ -130,6 +135,81 @@ def get_profile(user_id):
         st.error(f"Could not load profile: {e}")
         return {**DEFAULT_PROFILE, "id": user_id}
 
+
+def territory_ring(geojson):
+    if not geojson:
+        return []
+    try:
+        geom = geojson.get("geometry", geojson)
+        coords = geom.get("coordinates", [])
+        if geom.get("type") == "Polygon" and coords:
+            return [(float(lat), float(lon)) for lon, lat in coords[0]]
+        if geom.get("type") == "MultiPolygon" and coords:
+            return [(float(lat), float(lon)) for lon, lat in coords[0][0]]
+    except (TypeError, ValueError, KeyError):
+        pass
+    return []
+
+def bbox_for_ring(ring):
+    lats = [p[0] for p in ring]
+    lngs = [p[1] for p in ring]
+    return min(lngs), min(lats), max(lngs), max(lats)
+
+def inside_ring(lat, lng, ring):
+    if len(ring) < 3:
+        return False
+    inside = False
+    j = len(ring) - 1
+    for i, (yi, xi) in enumerate(ring):
+        yj, xj = ring[j]
+        crosses = ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi)
+        if crosses:
+            inside = not inside
+        j = i
+    return inside
+
+def fetch_satellite_snapshot(ring, width=1600, height=1200):
+    min_lon, min_lat, max_lon, max_lat = bbox_for_ring(ring)
+    response = requests.get(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export",
+        params={"bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}", "bboxSR": 4326, "imageSR": 4326, "size": f"{width},{height}", "format": "jpg", "f": "image"},
+        timeout=45,
+    )
+    response.raise_for_status()
+    return response.content, (min_lon, min_lat, max_lon, max_lat), width, height
+
+def pixel_to_latlng(x, y, width, height, bbox):
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lon = min_lon + (float(x) / max(width - 1, 1)) * (max_lon - min_lon)
+    lat = max_lat - (float(y) / max(height - 1, 1)) * (max_lat - min_lat)
+    return lat, lon
+
+def reverse_geocode(lat, lng):
+    key = get_secret("GOOGLE_MAPS_API_KEY")
+    if not (key and googlemaps):
+        return ""
+    try:
+        client = googlemaps.Client(key=key)
+        results = client.reverse_geocode((lat, lng))
+        return results[0].get("formatted_address", "") if results else ""
+    except Exception:
+        return ""
+
+def save_detected_doors(candidates, user_id, source):
+    added = 0
+    for item in candidates:
+        lat, lng = float(item["lat"]), float(item["lng"])
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180) or not inside_ring(lat, lng, item.get("ring", [])):
+            continue
+        address = item.get("address") or reverse_geocode(lat, lng) or f"Detected home {len(doors) + added + 1}"
+        if any(abs(float(d.get("lat") or 999) - lat) < 0.00008 and abs(float(d.get("lng") or 999) - lng) < 0.00008 for d in doors if d.get("lat") is not None and d.get("lng") is not None):
+            continue
+        confidence = item.get("confidence")
+        note = item.get("note", "")
+        note = f"{source} · confidence {float(confidence):.0%} · {note}".strip() if confidence is not None else f"{source} · {note}".strip()
+        insert("doorsteps", {"owner_id": user_id, "address": address, "lat": lat, "lng": lng, "status": item.get("status", "not"), "note": note[:500]})
+        added += 1
+    return added
 
 def current_user():
     if is_demo() or not st.session_state.get("auth_session"):
@@ -671,6 +751,15 @@ elif page == "Territory":
             st.success("Territory saved.")
             st.rerun()
 
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+        name="Satellite / aerial",
+        overlay=False,
+        control=True,
+    ).add_to(fmap)
+    folium.LayerControl(collapsed=False).add_to(fmap)
+
     st.subheader("Add doorstep")
     with st.form("door_add"):
         address = st.text_input("Address")
@@ -699,6 +788,64 @@ elif page == "Territory":
         )
         st.success("Doorstep saved.")
         st.rerun()
+
+    st.divider()
+    st.subheader("Home discovery")
+    st.caption("Draw and save a polygon territory above first. The mapped-home scan finds residential building footprints. The AI satellite scan obtains an aerial snapshot and uses a vision API to identify visible residential buildings.")
+    territory_choices = {f'{t.get("name", "Service area")} · {t.get("id", "")}': t for t in territories}
+    selected_territory_name = st.selectbox("Territory to scan", [""] + list(territory_choices.keys()), key="territory_scan_choice")
+    selected_geo = territory_choices[selected_territory_name].get("geojson") if selected_territory_name else None
+    ring = territory_ring(selected_geo)
+    scan1, scan2 = st.columns(2)
+    with scan1:
+        scan_mapped = st.button("⌕ Find mapped homes", use_container_width=True)
+    with scan2:
+        scan_ai = st.button("✦ AI satellite scan", type="primary", use_container_width=True)
+    if scan_mapped or scan_ai:
+        if len(ring) < 3:
+            st.error("Pick a saved polygon territory first.")
+        elif scan_mapped:
+            coords = " ".join(f"{lat} {lng}" for lat, lng in ring)
+            query = f'[out:json][timeout:35];way["building"](poly:"{coords}");out center tags;'
+            try:
+                response = requests.post("https://overpass-api.de/api/interpreter", data=query, timeout=45)
+                response.raise_for_status()
+                payload = response.json()
+                candidates=[]
+                for element in payload.get("elements", []):
+                    center=element.get("center"); tags=element.get("tags") or {}
+                    if not center or tags.get("building") not in {"house","residential","detached","semidetached_house","terrace","bungalow","apartments"}: continue
+                    address=" ".join(x for x in [tags.get("addr:housenumber",""),tags.get("addr:street","")] if x).strip()
+                    candidates.append({"lat":center["lat"],"lng":center["lon"],"address":address,"note":f'OSM building {element.get("type")}/{element.get("id")}',"ring":ring})
+                added=save_detected_doors(candidates,user_id,"Mapped home")
+                st.success(f"Found {len(candidates)} mapped residential buildings and added {added} new doorstep records.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Mapped-home scan failed: {e}")
+        if scan_ai:
+            api_key=get_secret("OPENAI_API_KEY")
+            if not api_key:
+                st.error("AI satellite scan needs an OPENAI_API_KEY secret.")
+            else:
+                try:
+                    with st.spinner("Getting aerial imagery and scanning for visible homes…"):
+                        image_bytes,bbox,img_w,img_h=fetch_satellite_snapshot(ring)
+                        import base64
+                        image_data=base64.b64encode(image_bytes).decode("ascii")
+                        ai_response=requests.post("https://api.openai.com/v1/chat/completions",headers={"Authorization":f"Bearer {api_key}"},json={"model":"gpt-4.1-mini","temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":"Inspect the supplied aerial image. Identify distinct visible residential homes/buildings only. Ignore cars, trees, sheds, pools, roads, parking lots and commercial buildings. Return JSON only with homes: an array of objects containing x, y pixel coordinates at the approximate roof center, confidence 0 to 1, and a short note."},{"role":"user","content":[{"type":"text","text":f"Image dimensions are {img_w}x{img_h}. Return a JSON object with a homes array containing x, y, confidence, and note."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{image_data}"}}]}]},timeout=120)
+                        ai_response.raise_for_status()
+                        raw=ai_response.json()["choices"][0]["message"]["content"]
+                        parsed=json.loads(raw.strip().replace(chr(96)*3+"json","").replace(chr(96)*3,""))
+                        candidates=[]
+                        for home in parsed.get("homes",[]):
+                            lat,lng=pixel_to_latlng(home.get("x",0),home.get("y",0),img_w,img_h,bbox)
+                            candidates.append({"lat":lat,"lng":lng,"confidence":home.get("confidence"),"note":home.get("note",""),"ring":ring})
+                        st.image(image_bytes,caption="Aerial snapshot used for AI scan",use_container_width=True)
+                        added=save_detected_doors(candidates,user_id,"AI satellite")
+                        st.success(f"AI identified {len(candidates)} visible home candidates and added {added} new doorstep records.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"AI satellite scan failed: {e}")
 
     if doors:
         st.subheader("Tracked doors")
